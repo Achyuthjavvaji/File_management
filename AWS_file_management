@@ -1,0 +1,229 @@
+import json
+import os
+import boto3
+import botocore
+import xmltodict
+from botocore.client import Config
+import requests
+from botocore.exceptions import ClientError
+import logging
+
+from pyramid.view import view_config
+from authenticationinterceptor.authenticationInterceptor import validate_token
+from pythonjsonlogger import jsonlogger
+from pyramid.response import Response
+
+logger = logging.getLogger('Filemanagement_logs')
+
+
+def auth_interceptor(request):
+    ignore_auth = request.headers.get("IGNORE-AUTH", None)
+    logging.info(ignore_auth)
+    print(ignore_auth)
+    if ignore_auth == "false" or ignore_auth == None:
+        try:
+            auth_header = request.headers.get("Authorization")
+            logging.info("auth_header")
+            logging.info(auth_header)
+            token = auth_header.split(" ")[1]
+            logging.info(token)
+            # token = token[:-1]
+            logging.info(validate_token(token))
+            print(validate_token(token))
+            return validate_token(token)
+        except AttributeError as e:
+            validity = {"status": "400", "info": "Token not available"}
+            # response = Response(validity)
+            # response.status_int = 400
+            return validity
+    else:
+        logging.info(validate_token)
+        validity = {"status": "200 OK"}
+        # response = Response(validity)
+        # response.status_int = 200
+        return validity
+
+
+s3_signature = {
+    'v4': 's3v4',
+    'v2': 's3'
+}
+
+AWS_ACCESS_KEY_ID = os.getenv('AWS_ACCESS_KEY_ID')
+AWS_SECRET_ACCESS_KEY = os.getenv('AWS_SECRET_ACCESS_KEY')
+AWS_DEFAULT_REGION = os.getenv('AWS_DEFAULT_REGION')
+
+
+@view_config(route_name='awsfileupload-o', renderer='json', request_method='OPTIONS')
+def create_presigned_url_options(request):
+    return {}
+
+
+@view_config(route_name='awsfileupload-p', renderer='json', request_method='POST')
+def create_presigned_url(request):
+    """
+    API used to create a pre-signed url for the file that needs to be uploaded.
+    """
+
+    # To check whether request method is a get call or not.
+    # if request.method != 'POST':
+    #    return {"Error": "Predicate mis-match error, please use a POST call"}
+
+    validity = auth_interceptor(request)
+
+    if validity.get('status', None) != "200 OK":
+        logging.info(validity)
+        response = Response(validity.get('info'))
+        response.status_int = 401
+        return response
+
+    try:
+        #bucket_name = request.json_body.get('BucketName')
+        bucket_name = os.getenv('BUCKETNAME')
+        bucket_key = request.json_body.get('Bucketkey')
+        expiration = 3600
+        signature_version = s3_signature['v4']
+
+        cors_configuration = {
+            'CORSRules': [{
+                'AllowedHeaders': ['Authorization'],
+                'AllowedMethods': ['GET', 'PUT'],
+                'AllowedOrigins': ['*'],
+                'ExposeHeaders': ['GET', 'PUT'],
+                'MaxAgeSeconds': 3000
+            }]
+        }
+
+            # s3 = boto3.resource('s3',
+            #                     aws_access_key_id=AWS_ACCESS_KEY_ID,
+            #                     aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
+            #                     config=Config(signature_version=signature_version),
+            #                     region_name=AWS_DEFAULT_REGION
+            #                     )
+            #
+            # try:
+            #     s3.Object(bucket_name).load()
+            # except botocore.exceptions.ClientError as e:
+            #     if e.response['Error']['Code'] == "404":
+            #         logging.error(e)
+            #         return {'Error': "Invalid Bucket Credentials"}
+            #     else:
+            #         logging.error(e)
+            #         return {'Error': "Invalid Bucket Credentials"}
+
+        s3_client = boto3.client('s3',
+                                 aws_access_key_id=AWS_ACCESS_KEY_ID,
+                                 aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
+                                 config=Config(signature_version=signature_version),
+                                 region_name=AWS_DEFAULT_REGION
+                                 )
+
+        #s3_client.put_bucket_cors(Bucket=bucket_name,
+        #                          CORSConfiguration=cors_configuration)
+
+        # used to generate S3 pre-signed upload url.
+        response = s3_client.generate_presigned_url('put_object',
+                                                    Params={'Bucket': bucket_name,
+                                                            'Key': bucket_key},
+                                                    ExpiresIn=expiration
+                                                    )
+
+        # return {"url": response}
+
+    # except:
+    #    return {'Error': 'Error in the request body or Bucket credentials error'}
+    except Exception as e:
+        logger.error(e)
+        # return None
+        return {'Error': 'Error in the request body or Bucket credentials error'}
+
+    return {"url": response}
+
+
+@view_config(route_name='awsfiledownload-o', renderer='json', request_method='OPTIONS')
+def get_presigned_url_options(request):
+    return {}
+
+
+@view_config(route_name='awsfiledownload-p', renderer='json', request_method='POST')
+def get_presigned_url(request):
+    """
+    This API is used to download a file from AWS
+    from specified Bucket_Name and Bucket_Key
+    """
+
+    # To check whether request method is a get call or not.
+    # if request.method != 'POST':
+    #    return {"Error": "Predicate mis-match error, please use a POST call"}
+
+    validity = auth_interceptor(request)
+
+    if validity.get('status', None) != "200 OK":
+        logging.info(validity)
+        response = Response(validity.get('info'))
+        response.status_int = 401
+        return response
+
+    try:
+
+        # specified JSON body for retrieving Bucket_Name and Bucket_key
+        # bucket_name = request.json_body.get('BucketName')
+        bucket_name = os.getenv('BUCKETNAME')
+        bucket_key = request.json_body.get('Bucketkey')
+
+
+        expiration = 3600
+        signature_version = s3_signature['v4']
+
+        s3_client = boto3.client('s3',
+                                 aws_access_key_id=AWS_ACCESS_KEY_ID,
+                                 aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
+                                 config=Config(signature_version=signature_version),
+                                 region_name=AWS_DEFAULT_REGION
+                                 )
+        s3 = boto3.resource('s3',
+                            aws_access_key_id=AWS_ACCESS_KEY_ID,
+                            aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
+                            config=Config(signature_version=signature_version),
+                            region_name=AWS_DEFAULT_REGION
+                            )
+
+        # s3.Object(bucket_name, bucket_key).load()
+
+        try:
+            s3.Object(bucket_name, bucket_key).load()
+        except botocore.exceptions.ClientError as e:
+            if e.response['Error']['Code'] == "404":
+                logging.error(e)
+                return {'Error': "Invalid Bucket Credentials"}
+            else:
+                logging.error(e)
+                return {'Error': "Invalid Bucket Credentials"}
+                # raise
+
+        # Generating Pre-singed URL for downloading
+        response = s3_client.generate_presigned_url('get_object',
+                                                    Params={'Bucket': bucket_name,
+                                                            'Key': bucket_key},
+                                                    ExpiresIn=expiration)
+        return {"url": response}
+
+        # error = requests.get(response).text
+        # error_text = ''
+        # try:
+        #     # checking whether it is a valid URL or not
+        #     r = requests.get(response)
+        #     error_text = r.text
+        #     r.raise_for_status()  # Raises a HTTPError if the status is 4xx, 5xxx
+        # except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
+        #     return {"Error": "SERVER DOWN"}
+        # except requests.exceptions.HTTPError:
+        #     error_response = json.dumps(xmltodict.parse(error_text))
+        #     logging.error(error_response)
+        #     return json.loads(error_response)
+    except Exception as e:
+
+        logging.error(str(e))
+        return {'Error': "Invalid Bucket credentials, cannot use special characters"}
+
+    # return {"url": response}
