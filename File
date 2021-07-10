@@ -1,0 +1,1356 @@
+from pyramid.view import view_config
+from waitress.utilities import join
+
+from filemanagement import models
+from filemanagement.utils import convert_sqlobj_json
+import transaction
+from json import loads
+import datetime
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
+# from sqlalchemy import exc
+# import requests
+import logging
+# import itertools
+import json
+from authenticationinterceptor.authenticationInterceptor import validate_token
+from pythonjsonlogger import jsonlogger
+from pyramid.response import Response
+from snsmessageutility.sns_utility import sendMessageS3
+import os
+
+logger = logging.getLogger('Filemanagement_logs')
+
+
+def auth_interceptor(request):
+    ignore_auth = request.headers.get("IGNORE-AUTH", None)
+    logging.info(ignore_auth)
+    print(ignore_auth)
+    if ignore_auth == "false" or ignore_auth == None:
+        try:
+            auth_header = request.headers.get("Authorization")
+            logging.info("auth_header")
+            logging.info(auth_header)
+            token = auth_header.split(" ")[1]
+            logging.info(token)
+            # token = token[:-1]
+            logging.info(validate_token(token))
+            print(validate_token(token))
+            return validate_token(token)
+        except AttributeError as e:
+            validity = {"status": "400", "info": "Token not available"}
+            # response = Response(validity)
+            # response.status_int = 400
+            return validity
+    else:
+        logging.info(validate_token)
+        validity = {"status": "200 OK"}
+        # response = Response(validity)
+        # response.status_int = 200
+        return validity
+
+
+@view_config(route_name='document_tagging', renderer='json', request_method='GET')
+def get_tag(request):
+    validity = auth_interceptor(request)
+
+    if validity.get('status', None) != "200 OK":
+        logging.info(validity)
+        response = Response(validity.get('info'))
+        response.status_int = 401
+        return response
+
+    if request.method != 'GET':
+        return {"Error": "Predicate mis-match error, please use a GET call"}
+
+    loanType = request.matchdict['loanType']
+    loanStage = request.matchdict['loanStage']
+    loanState = request.matchdict['loanState']
+    logging.info('COMING HERE')
+    query = request.dbsession.query(models.ProductCategory,
+                                    models.ProductCategoryTagXREF,
+                                    models.tags, models.TagCategoryXREF)
+    join_query = query.join(models.ProductCategory).join(models.tags).outerjoin(models.TagCategoryXREF)
+    logging.info(join_query)
+    temp = join_query.filter(models.ProductCategory.loan_type == loanType).filter(
+        models.ProductCategory.loan_stage == loanStage).filter(
+        models.ProductCategory.loan_state == loanState).all()
+
+    response_dict = {}
+    for i in temp:
+        tagCategory = None
+        row2dict = i._asdict()
+        logging.info(row2dict)
+        prod_category = convert_sqlobj_json.to_json(row2dict.get("ProductCategory"))
+        if response_dict.get(prod_category.get("product_category_id"), None):
+            is_mand = convert_sqlobj_json.to_json(row2dict.get("ProductCategoryTagXREF")).get("is_mandatory")
+            order = convert_sqlobj_json.to_json(row2dict.get("ProductCategoryTagXREF")).get("category_order")
+            logging.info(order)
+            temp_list = convert_sqlobj_json.to_json(row2dict.get("tags"))
+
+            if row2dict.get('TagCategoryXREF'):
+                tagCategory = convert_sqlobj_json.to_json(row2dict.get('TagCategoryXREF')).get('name')
+            tag_dict = {
+                "name": temp_list.get("tag_name"),
+                "code": temp_list.get("tag_code"),
+                "isMandatory": is_mand,
+                "description": temp_list.get("tag_description"),
+                "tagCategory": tagCategory,
+                "tagType": temp_list.get("tag_type"),
+                "order": order
+            }
+
+            response_dict.get(prod_category.get("product_category_id")).get("tags").append(tag_dict)
+
+        else:
+            is_mand = convert_sqlobj_json.to_json(row2dict.get("ProductCategoryTagXREF")).get("is_mandatory")
+            order = convert_sqlobj_json.to_json(row2dict.get("ProductCategoryTagXREF")).get("category_order")
+            temp_list = convert_sqlobj_json.to_json(row2dict.get("tags"))
+            if row2dict.get('TagCategoryXREF'):
+                tagCategory = convert_sqlobj_json.to_json(row2dict.get('TagCategoryXREF')).get('name')
+            tag_dict = {
+                "name": temp_list.get("tag_name"),
+                "code": temp_list.get("tag_code"),
+                "isMandatory": is_mand,
+                "description": temp_list.get("tag_description"),
+                "tagCategory": tagCategory,
+                "tagType": temp_list.get("tag_type"),
+                "order": order
+            }
+
+            temp_prod_dict = {
+                "loanType": prod_category.get("loan_type"),
+                "loanStage": prod_category.get("loan_stage"),
+                "loanState": prod_category.get("loan_state"),
+                "minimumOptionalDocumentCount": prod_category.get("min_optional_doc_count"),
+                "tags": [tag_dict]
+            }
+            response_dict[prod_category.get("product_category_id")] = temp_prod_dict
+
+    final_list = []
+    for k in response_dict:
+        temp_dict = response_dict.get(k)
+        logging.info(temp_dict)
+        temp_dict['tags'] = sorted(temp_dict.get('tags'), key=lambda tags: tags.get('order'))
+        final_list.append(temp_dict)
+
+    return final_list
+
+
+@view_config(route_name='adddocumentandtags', renderer='json', request_method='POST')
+def add_doc(request):
+    validity = auth_interceptor(request)
+
+    if validity.get('status', None) != "200 OK":
+        logging.info(validity)
+        response = Response(validity.get('info'))
+        response.status_int = 401
+        return response
+
+    if request.method != 'POST':
+        return {"Error": "Predicate mis-match error, please use a POST call"}
+
+    data = loads(request.body, encoding=request.charset)
+    str_data = str(data)
+    # logging.info("request data:::"+str_data)
+    # if True:
+
+    try:
+        def add_documents(data):
+
+            doc_map_class = models.DocumentMap(identifier_name=data['identifier_name'],
+                                               identifier_value=data['identifier_value'],
+                                               secondary_identifier_name=data['secondary_identifier_name'],
+                                               secondary_identifier_value=data['secondary_identifier_value'],
+                                               createdBy=data['createdBy'],
+                                               updatedBy=data['updatedBy'])
+
+            for key_doc in data["documents"]:
+                # print(key_doc)
+                # logger.info(key_doc)
+                doc_entry_class = models.Document(
+                    document_name=key_doc['name'],
+                    document_path=key_doc['path'],
+                    box_document_path=key_doc['box_document_path'],
+                    createdBy=key_doc['createdBy'],
+                    updatedBy=key_doc['updatedBy'])
+                doc_map_class.documentrelation.append(doc_entry_class)
+
+                tags_1 = key_doc['tags']
+                # print(tags_1)
+                # logger.info(tags_1)
+                for j in tags_1:
+                    tag_dict_append = j['tag']
+                    tag_code = request.dbsession.query(models.tags).filter(
+                        models.tags.tag_code == tag_dict_append['code']).first()
+                    tag_id = tag_code.tag_id
+                    temp_dict_doctagxref = models.DocTagXREF(
+                        tag_type=j['tagType'],
+                        tag_status=j['tagStatus'],
+                        createdBy=j['createdBy'],
+                        updatedBy=j['updatedBy'],
+                        # document_id= doc_entry_class.document_id,
+                        tag_id=tag_id
+                    )
+                    doc_entry_class.doc_tag_xref_relation.append(temp_dict_doctagxref)
+
+                request.dbsession.add(doc_entry_class)
+                request.dbsession.flush()
+                request.dbsession.refresh(doc_entry_class)
+                jsondata = convert_sqlobj_json.to_json(doc_entry_class)
+                print("DOC_ENTRY_CLASS:::::::::::::::", jsondata)
+
+                docid = doc_entry_class.document_id
+                created_on = str(doc_entry_class.createdOn)
+                key_doc['id'] = docid
+                key_doc['createdOn'] = created_on
+
+
+
+    except SQLAlchemyError as e:
+        logging.exception("message")
+        logger.error(e)
+        return "Error while inserting the document details"
+
+    print(add_documents(data))
+    # return "Insert Successful"
+    final_response = data['documents']
+    return final_response
+
+
+@view_config(route_name='addDocuments', renderer='json', request_method='POST')
+def add_document(request):
+    validity = auth_interceptor(request)
+
+    if validity.get('status', None) != "200 OK":
+        logging.info(validity)
+        response = Response(validity.get('info'))
+        response.status_int = 401
+        return response
+
+    if request.method != 'POST':
+        return {"Error": "Predicate mis-match error, please use a POST call"}
+    identifierName = request.matchdict['identifierName']
+    identifierValue = request.matchdict['identifierValue']
+    secondary_identifier_name = request.params.get('secondary_identifier_name')
+    secondary_identifier_value = request.params.get('secondary_identifier_value')
+    removeTaggedFiles = str(request.params.get('removeTaggedFiles')).lower()
+    logging.info(removeTaggedFiles)
+    if removeTaggedFiles == 'true':
+        print("TRUE")
+        removeTaggedFiles = True
+    else:
+        print('False')
+        removeTaggedFiles = False
+
+    data = loads(request.body, encoding=request.charset)
+    print("data::::", data)
+    str_data = str(data)
+    # logging.info("request data:::"+str_data)
+    # if True:
+
+    try:
+
+        getting_documents_old = fetch_document(request)
+        data_document_old = getting_documents_old
+        logger.info(data_document_old)
+
+        if removeTaggedFiles:
+
+            docID_tagCode_dict = {}
+            list_tags_in_old_data = []
+            for tag_details in data_document_old:
+                tags = tag_details.get('tags')
+                tag_list = []
+                tag_code_flag = len(tags)
+                for inner_tag_object in tags:
+                    # code = docID_tagCode_dict.get(inner_tag_object.get('tag').get('code'), None)
+                    # logging.info(code)
+                    # doc_id = tag_details.get('id')
+                    # if code:
+                    #     docID_tagCode_dict[(inner_tag_object.get('tag').get('code'))].append(doc_id)
+                    #     logging.info("inside {data}".format(data=docID_tagCode_dict))
+                    # else:
+                    #     docID_tagCode_dict[inner_tag_object.get('tag').get('code')] = [doc_id]
+                    #     list_tags_in_old_data.append(inner_tag_object.get('tag').get('code'))
+                    tag_list.append(inner_tag_object.get('tag').get('code'))
+                docID_tagCode_dict[tag_details.get('id')] = tag_list
+
+            logging.info(docID_tagCode_dict)
+
+            for new_update_dict in data:
+
+                for new_request_tag in new_update_dict.get('tags'):
+                    tag_code = new_request_tag.get('tag').get('code')
+                    if True:
+                        logging.info(tag_code)
+                        # doc_ids = docID_tagCode_dict.get(tag_code)
+                        for doc_id in docID_tagCode_dict:
+                            tags = docID_tagCode_dict.get(doc_id)
+                            if tag_code in tags:
+                                if len(tags) == 1:
+                                    delete_doc_from_id(doc_id, identifierName, request)
+                                else:
+                                    delete_tag_by_code(doc_id, request, tag_code)
+
+                        # for doc_id in doc_ids:
+                        #     delete_doc_from_id(doc_id,identifierName,request)
+                        #     logging.info('SOFT DELETE')
+
+        doc_map_class = models.DocumentMap(identifier_name=identifierName,
+                                           identifier_value=identifierValue,
+                                           secondary_identifier_name=secondary_identifier_name,
+                                           secondary_identifier_value=secondary_identifier_value,
+                                           )
+
+        for key_doc in data:
+            # print(key_doc)
+            # logger.info(key_doc)
+
+            doc_entry_class = models.Document(
+                document_name=key_doc['name'],
+                document_path=key_doc['path'],
+                box_document_path=key_doc['box_document_path'],
+                createdBy=key_doc['createdBy'],
+                updatedBy=key_doc['updatedBy'])
+            doc_map_class.documentrelation.append(doc_entry_class)
+
+            tags_1 = key_doc['tags']
+            # print(tags_1)
+            # logger.info(tags_1)
+            for j in tags_1:
+                tag_dict_append = j['tag']
+                tag_code = request.dbsession.query(models.tags).filter(
+                    models.tags.tag_code == tag_dict_append['code']).first()
+                tag_id = tag_code.tag_id
+                temp_dict_doctagxref = models.DocTagXREF(
+                    tag_type=j['tagType'],
+                    tag_status=j['tagStatus'],
+                    createdBy=j['createdBy'],
+                    updatedBy=j['updatedBy'],
+                    # document_id= doc_entry_class.document_id,
+                    tag_id=tag_id
+                )
+                doc_entry_class.doc_tag_xref_relation.append(temp_dict_doctagxref)
+
+            request.dbsession.add(doc_entry_class)
+            request.dbsession.flush()
+            request.dbsession.refresh(doc_entry_class)
+            jsondata = convert_sqlobj_json.to_json(doc_entry_class)
+            # print("DOC_ENTRY_CLASS:::::::::::::::", jsondata)
+
+            docid = doc_entry_class.document_id
+            created_on = str(doc_entry_class.createdOn)
+            key_doc['id'] = docid
+            key_doc['createdOn'] = created_on
+
+        ##SNS Message utility
+        header = {'resource': 'document_service',
+                  'resourceUrl': 'docs/{identifier_name}/{identifier_value}/documents?secondary_identifier_name={secondary_identifier_name}&secondary_identifier_value={secondary_identifier_value}'.format(
+                      identifier_name=identifierName, identifier_value=identifierValue,
+                      secondary_identifier_name=secondary_identifier_name,
+                      secondary_identifier_value=secondary_identifier_value),
+                  'event_type': ["Add"],
+                  'notification': True,
+                  'message_body_type': 'S3',
+                  'id': '{identifier_name}-{identifier_value}'.format(identifier_name=identifierName,
+                                                                      identifier_value=identifierValue),
+                  'version': 1,
+                  'timestamp': str(datetime.datetime.utcnow())}
+
+        getting_documents_new = fetch_document(request)
+        data_document_new = getting_documents_new
+        logger.info(data_document_new)
+        data_sns = {"identifierName": identifierName,
+                    "identifierValue": identifierValue,
+                    "secondaryIdentifierName": secondary_identifier_name,
+                    "secondaryIdentifierValue": secondary_identifier_value,
+                    "documents": data_document_new}
+        # data_sns = data_document_new
+        messageConfig_1 = {'serviceName': 'DOCUMENT_SERVICE'}
+        TopicArn = os.getenv('TOPIC_ARN')
+        logging.info("TopicArn:::")
+        logging.info(TopicArn)
+        MESSAGE_BUCKET_NAME = os.getenv('MESSAGE_BUCKET_NAME')
+        logging.info("MESSAGE_BUCKET_NAME:::")
+        logging.info(MESSAGE_BUCKET_NAME)
+        old_data = {"identifierName": identifierName,
+                    "identifierValue": identifierValue,
+                    "secondaryIdentifierName": secondary_identifier_name,
+                    "secondaryIdentifierValue": secondary_identifier_value,
+                    "documents": data_document_old}
+        # old_data = data_document_old
+        sendMessageS3(header, data_sns, messageConfig_1, old_data)
+
+    except SQLAlchemyError as e:
+        logging.exception("message")
+        logger.error(e)
+        return "Error while inserting the document details"
+
+    # print(add_documents(data))
+    # return "Insert Successful"
+    # print("final_data:::::;", data)
+    # final_response = data['documents']
+    return data
+
+
+@view_config(route_name='delete_documents-o', renderer='json', request_method='OPTIONS')
+def delete_doc_options(request):
+    return {}
+
+
+@view_config(route_name='delete_documents-d', renderer='json', request_method='DELETE')
+def delete_doc(request):
+    validity = auth_interceptor(request)
+
+    if validity.get('status', None) != "200 OK":
+        logging.info(validity)
+        response = Response(validity.get('info'))
+        response.status_int = 401
+        return response
+
+    if request.method != 'DELETE':
+        return {"Error": "Predicate mis-match error, please use a DELETE call"}
+
+    identifierName = request.matchdict['identifierName']
+    documentId = request.matchdict['documentId']
+
+    try:
+        to_return = delete_doc_from_id(documentId, identifierName, request)
+        return to_return
+    except Exception as e:
+        logging.error(str(e))
+        return {'Error':'Enter the valid query or path parameters'}
+
+@view_config(route_name='delete_multi_documents-o', renderer='json', request_method='OPTIONS')
+def delete_multi_doc_options(request):
+    return {}
+
+@view_config(route_name='delete_multi_documents-d', renderer='json', request_method='DELETE')
+def delete_multi_doc(request):
+    validity = auth_interceptor(request)
+
+    if validity.get('status', None) != "200 OK":
+        logging.info(validity)
+        response = Response(validity.get('info'))
+        response.status_int = 401
+        return response
+
+    if request.method != 'DELETE':
+        return {"Error": "Predicate mis-match error, please use a DELETE call"}
+    
+    list_obj = loads(request.body)
+    identifierName = list_obj.get('identifierName')
+    for documentId in list_obj['docIds']:
+        try:
+            to_return = delete_doc_from_id(documentId, identifierName, request)
+            if to_return == "Delete successful":
+                pass
+            else:
+                request.response.status = 400
+                return to_return
+        except Exception as e:
+            logging.error(str(e))
+            request.response.status = 400
+            return {'Error':'Enter the valid query or path parameters'}
+        
+    return "Delete successful"
+
+def delete_doc_from_id(documentId, identifierName, request):
+    identifierName_check = request.dbsession.query(models.DocumentMap).filter(
+        models.DocumentMap.identifier_name == identifierName).first()
+    documentId_check = request.dbsession.query(models.Document).filter(
+        models.Document.document_id == documentId).first()
+    # print(type(identifierName_check))
+    if identifierName_check is not None:
+
+        if documentId_check is not None:
+
+            query = request.dbsession.query(models.DocTagXREF).filter(
+                models.DocTagXREF.document_id == documentId).update(
+                {models.DocTagXREF.deletedOn: datetime.datetime.now()},
+                synchronize_session=False)
+
+            query = request.dbsession.query(models.Document).filter(
+                models.Document.document_id == documentId).update({models.Document.deletedOn: datetime.datetime.now()},
+                                                                  synchronize_session=False)
+
+            doc_ids = request.dbsession.query(models.Document).filter(
+                models.Document.document_id == documentId).first()
+            doc_map_id = doc_ids.document_map_id
+
+            query = request.dbsession.query(models.DocumentMap).filter(
+                models.DocumentMap.document_map_id == doc_map_id).filter(
+                models.DocumentMap.identifier_name == identifierName).update(
+                {models.DocumentMap.deletedOn: datetime.datetime.now()},
+                synchronize_session=False)
+
+            transaction.commit()
+
+            return "Delete successful"
+        else:
+            return "Document Id {docId} does not exist in the database".format(docId = documentId)
+    else:
+        return "Identifier Name {id_name} does not exist in the database".format(id_name = identifierName)
+
+
+@view_config(route_name='delete_all_documents-o', renderer='json', request_method='OPTIONS')
+def delete_all_docs_options(request):
+    return {}
+
+
+@view_config(route_name='delete_all_documents-d', renderer='json', request_method='DELETE')
+def delete_all_docs(request):
+    validity = auth_interceptor(request)
+
+    if validity.get('status', None) != "200 OK":
+        logging.info(validity)
+        response = Response(validity.get('info'))
+        response.status_int = 401
+        return response
+
+    if request.method != 'DELETE':
+        return {"Error": "Predicate mis-match error, please use a DELETE call"}
+    try:
+        identifierName = request.matchdict['identifierName']
+
+        identifierName_check = request.dbsession.query(models.DocumentMap).filter(
+            models.DocumentMap.identifier_name == identifierName).first()
+
+        if identifierName_check is not None:
+
+            doc_map_ids = request.dbsession.query(models.DocumentMap.document_map_id).filter(
+                models.DocumentMap.identifier_name == identifierName)
+
+            q_1 = request.dbsession.query(models.Document.document_id).filter(
+                models.Document.document_map_id.in_(doc_map_ids.subquery()))
+
+            q = request.dbsession.query(models.DocTagXREF.document_id).filter(
+                models.DocTagXREF.document_id.in_(q_1.subquery()))
+
+            # q.delete(synchronize_session=False)
+            q.update({models.DocTagXREF.deletedOn: datetime.datetime.now()},
+                     synchronize_session=False)
+
+            doc_map_ids = request.dbsession.query(models.DocumentMap.document_map_id).filter(
+                models.DocumentMap.identifier_name == identifierName)
+
+            q_1 = request.dbsession.query(models.Document.document_id).filter(
+                models.Document.document_map_id.in_(doc_map_ids))
+
+            # q_1.delete(synchronize_session=False)
+            q_1.update({models.Document.deletedOn: datetime.datetime.now()}, synchronize_session=False)
+
+            doc_map_ids = request.dbsession.query(models.DocumentMap.document_map_id).filter(
+                models.DocumentMap.identifier_name == identifierName)
+
+            # doc_map_ids.delete(synchronize_session=False)
+            doc_map_ids.update({models.DocumentMap.deletedOn: datetime.datetime.now()},
+                               synchronize_session=False)
+
+            return "Deleted all documents successfully"
+
+        else:
+            return " The given Identifier Name does not exist in the database"
+    except Exception as e:
+        logging.error(str(e))
+        return {'Error': 'Please enter valid query or path parameters'}
+
+@view_config(route_name='add_multiple_tags', renderer='json', request_method='POST')
+def multi_tag(request):
+    try:
+        validity = auth_interceptor(request)
+
+        if validity.get('status', None) != "200 OK":
+            logging.info(validity)
+            response = Response(validity.get('info'))
+            response.status_int = 401
+            return response
+
+        if request.method != 'POST':
+            return {"Error": "Predicate mis-match error, please use a POST call"}
+        list_obj = loads(request.body)
+        removeTaggedFiles = str(request.params.get('removeTaggedFiles')).lower()
+        logging.info(removeTaggedFiles)
+        if removeTaggedFiles == 'true':
+            print("TRUE")
+            removeTaggedFiles = True
+        else:
+            print('False')
+            removeTaggedFiles = False
+        
+        
+        for documentId in list_obj['docIds']:
+            try:
+                document_obj = request.dbsession.query(models.Document).filter(
+                    models.Document.document_id == documentId).first()
+                document_map_id = document_obj.document_map_id
+                document_map_obj = request.dbsession.query(models.DocumentMap).filter(
+                    models.DocumentMap.document_map_id == document_map_id).first()
+
+
+
+                identifier_name = document_map_obj.identifier_name
+                identifier_value = document_map_obj.identifier_value
+                secondary_identifier_name = document_map_obj.secondary_identifier_name
+                secondary_identifier_value = document_map_obj.secondary_identifier_value
+
+                logging.info(identifier_name)
+                logging.info(identifier_value)
+                logging.info(secondary_identifier_name)
+                logging.info(secondary_identifier_value)
+
+                details = create_document(identifier_name, identifier_value, None, None, request,
+                                          secondary_identifier_name, secondary_identifier_value, None)
+                data_document_old = details
+                logger.info(data_document_old)
+                if removeTaggedFiles:
+
+                    docID_tagCode_dict = {}
+                    list_tags_in_old_data = []
+                    for tag_details in data_document_old:
+                        tags = tag_details.get('tags')
+                        tag_list = []
+                        tag_code_flag = len(tags)
+                        for inner_tag_object in tags:
+                            # code = docID_tagCode_dict.get(inner_tag_object.get('tag').get('code'), None)
+                            # logging.info(code)
+                            # doc_id = tag_details.get('id')
+                            # if code:
+                            #     docID_tagCode_dict[(inner_tag_object.get('tag').get('code'))].append(doc_id)
+                            #     logging.info("inside {data}".format(data=docID_tagCode_dict))
+                            # else:
+                            #     docID_tagCode_dict[inner_tag_object.get('tag').get('code')] = [doc_id]
+                            #     list_tags_in_old_data.append(inner_tag_object.get('tag').get('code'))
+                            tag_list.append(inner_tag_object.get('tag').get('code'))
+                        docID_tagCode_dict[tag_details.get('id')] = tag_list
+
+                    logging.info(docID_tagCode_dict)
+
+                    for new_update_dict in list_obj['tags']:
+                        tag_code = new_update_dict.get('tag').get('code')
+                        if True:
+                            logging.info(tag_code)
+                            # doc_ids = docID_tagCode_dict.get(tag_code)
+                            for doc_id in docID_tagCode_dict:
+                                tags = docID_tagCode_dict.get(doc_id)
+                                if tag_code in tags:
+                                    if len(tags) == 1:
+                                        delete_doc_from_id(doc_id, identifier_name, request)
+
+                                    else:
+                                        delete_tag_by_code(doc_id, request, tag_code)
+
+
+
+                def adding_tags(list_obj):
+                    tag_list = []
+                    for j in list_obj:
+                        tag_dict_append = j['tag']
+                        # tag_dict.append(tag_dict_append)
+                        new_entry_tags = {"tagType": j['tagType'],
+                                          "tagStatus": j['tagStatus'],
+                                          "tag": tag_dict_append}
+                        temp_dict_tag = {"tag_name": tag_dict_append['name'],
+                                         "tag_code": tag_dict_append['code']}
+
+                        tag_list.append(new_entry_tags)
+                        print(tag_list)
+                        tag_code = request.dbsession.query(models.tags).filter(
+                            models.tags.tag_code == tag_dict_append['code']).first()
+                        tag_id = tag_code.tag_id
+
+                        temp_dict_doctagxref = {"tag_type": j['tagType'],
+                                                "tag_status": j['tagStatus'],
+                                                "createdBy": j['createdBy'],
+                                                "updatedBy": j['updatedBy'],
+                                                "document_id": documentId,
+                                                "tag_id": tag_id
+                                                }
+                        doctagxref_insert = models.DocTagXREF(**temp_dict_doctagxref)
+                        request.dbsession.add(doctagxref_insert)
+
+                    transaction.commit()
+
+                print(adding_tags(list_obj['tags']))
+                print("Tags added for ",documentId)
+            except SQLAlchemyError as e:
+                logging.exception("message")
+                logger.error(e)
+                return "Error while inserting the tag details"
+
+        return "Tags successfully added"
+    except Exception as e:
+        exc_type, exc_obj, exc_tb = sys.exc_info()
+        print(exc_type,exc_tb.tb_lineno)
+        logging.error(exc_type)
+        logging.error(exc_tb.tb_lineno)
+        return {"Error": str(e)}
+
+
+@view_config(route_name='add_tags', renderer='json', request_method='POST')
+def add_tag(request):
+    try:
+        validity = auth_interceptor(request)
+
+        if validity.get('status', None) != "200 OK":
+            logging.info(validity)
+            response = Response(validity.get('info'))
+            response.status_int = 401
+            return response
+
+        if request.method != 'POST':
+            return {"Error": "Predicate mis-match error, please use a POST call"}
+        documentId = request.matchdict['documentId']
+        list_obj = loads(request.body, encoding=request.charset)
+        removeTaggedFiles = str(request.params.get('removeTaggedFiles')).lower()
+        logging.info(removeTaggedFiles)
+        if removeTaggedFiles == 'true':
+            print("TRUE")
+            removeTaggedFiles = True
+        else:
+            print('False')
+            removeTaggedFiles = False
+        try:
+            document_obj = request.dbsession.query(models.Document).filter(
+                models.Document.document_id == documentId).first()
+            document_map_id = document_obj.document_map_id
+            document_map_obj = request.dbsession.query(models.DocumentMap).filter(
+                models.DocumentMap.document_map_id == document_map_id).first()
+
+
+
+            identifier_name = document_map_obj.identifier_name
+            identifier_value = document_map_obj.identifier_value
+            secondary_identifier_name = document_map_obj.secondary_identifier_name
+            secondary_identifier_value = document_map_obj.secondary_identifier_value
+
+            logging.info(identifier_name)
+            logging.info(identifier_value)
+            logging.info(secondary_identifier_name)
+            logging.info(secondary_identifier_value)
+
+            details = create_document(identifier_name, identifier_value, None, None, request,
+                                      secondary_identifier_name, secondary_identifier_value, None)
+            data_document_old = details
+            logger.info(data_document_old)
+            if removeTaggedFiles:
+
+                docID_tagCode_dict = {}
+                list_tags_in_old_data = []
+                for tag_details in data_document_old:
+                    tags = tag_details.get('tags')
+                    tag_list = []
+                    tag_code_flag = len(tags)
+                    for inner_tag_object in tags:
+                        # code = docID_tagCode_dict.get(inner_tag_object.get('tag').get('code'), None)
+                        # logging.info(code)
+                        # doc_id = tag_details.get('id')
+                        # if code:
+                        #     docID_tagCode_dict[(inner_tag_object.get('tag').get('code'))].append(doc_id)
+                        #     logging.info("inside {data}".format(data=docID_tagCode_dict))
+                        # else:
+                        #     docID_tagCode_dict[inner_tag_object.get('tag').get('code')] = [doc_id]
+                        #     list_tags_in_old_data.append(inner_tag_object.get('tag').get('code'))
+                        tag_list.append(inner_tag_object.get('tag').get('code'))
+                    docID_tagCode_dict[tag_details.get('id')] = tag_list
+
+                logging.info(docID_tagCode_dict)
+
+                for new_update_dict in list_obj:
+                    tag_code = new_update_dict.get('tag').get('code')
+                    if True:
+                        logging.info(tag_code)
+                        # doc_ids = docID_tagCode_dict.get(tag_code)
+                        for doc_id in docID_tagCode_dict:
+                            tags = docID_tagCode_dict.get(doc_id)
+                            if tag_code in tags:
+                                if len(tags) == 1:
+                                    delete_doc_from_id(doc_id, identifier_name, request)
+
+                                else:
+                                    delete_tag_by_code(doc_id, request, tag_code)
+
+
+
+            def adding_tags(list_obj):
+                tag_list = []
+                for j in list_obj:
+                    tag_dict_append = j['tag']
+                    # tag_dict.append(tag_dict_append)
+                    new_entry_tags = {"tagType": j['tagType'],
+                                      "tagStatus": j['tagStatus'],
+                                      "tag": tag_dict_append}
+                    temp_dict_tag = {"tag_name": tag_dict_append['name'],
+                                     "tag_code": tag_dict_append['code']}
+
+                    tag_list.append(new_entry_tags)
+                    print(tag_list)
+                    tag_code = request.dbsession.query(models.tags).filter(
+                        models.tags.tag_code == tag_dict_append['code']).first()
+                    tag_id = tag_code.tag_id
+
+                    temp_dict_doctagxref = {"tag_type": j['tagType'],
+                                            "tag_status": j['tagStatus'],
+                                            "createdBy": j['createdBy'],
+                                            "updatedBy": j['updatedBy'],
+                                            "document_id": documentId,
+                                            "tag_id": tag_id
+                                            }
+                    doctagxref_insert = models.DocTagXREF(**temp_dict_doctagxref)
+                    request.dbsession.add(doctagxref_insert)
+
+                transaction.commit()
+
+            print(adding_tags(list_obj))
+
+        except SQLAlchemyError as e:
+            logging.exception("message")
+            logger.error(e)
+            return "Error while inserting the tag details"
+
+        return "Tags successfully added"
+    except Exception as e:
+        logging.info(str(e))
+        return {"Error": str(e)}
+
+@view_config(route_name='add_comprehend_tags', renderer='json', request_method='POST')
+def add_comprehend_tag(request):
+    try:
+        validity = auth_interceptor(request)
+
+        if validity.get('status', None) != "200 OK":
+            logging.info(validity)
+            response = Response(validity.get('info'))
+            response.status_int = 401
+            return response
+
+        if request.method != 'POST':
+            return {"Error": "Predicate mis-match error, please use a POST call"}
+        documentId = request.matchdict['documentId']
+        print(documentId)
+        list_obj = loads(request.body, encoding=request.charset)
+        print(list_obj)
+        removeTaggedFiles = str(request.params.get('removeTaggedFiles')).lower()
+        print("-------------------")
+        logging.info(removeTaggedFiles)
+        if removeTaggedFiles == 'true':
+            print("TRUE")
+            removeTaggedFiles = True
+        else:
+            print('False')
+            removeTaggedFiles = False
+        try:
+            document_obj = request.dbsession.query(models.Document).filter(
+                models.Document.document_id == documentId).first()
+            document_map_id = document_obj.document_map_id
+            document_map_obj = request.dbsession.query(models.DocumentMap).filter(
+                models.DocumentMap.document_map_id == document_map_id).first()
+
+
+
+            identifier_name = document_map_obj.identifier_name
+            identifier_value = document_map_obj.identifier_value
+            secondary_identifier_name = document_map_obj.secondary_identifier_name
+            secondary_identifier_value = document_map_obj.secondary_identifier_value
+
+            logging.info(identifier_name)
+            logging.info(identifier_value)
+            logging.info(secondary_identifier_name)
+            logging.info(secondary_identifier_value)
+
+            details = create_document(identifier_name, identifier_value, None, None, request,
+                                      secondary_identifier_name, secondary_identifier_value, None)
+            data_document_old = details
+            logger.info(data_document_old)
+            if removeTaggedFiles:
+
+                docID_tagCode_dict = {}
+                list_tags_in_old_data = []
+                for tag_details in data_document_old:
+                    tags = tag_details.get('tags')
+                    tag_list = []
+                    tag_code_flag = len(tags)
+                    for inner_tag_object in tags:
+                        # code = docID_tagCode_dict.get(inner_tag_object.get('tag').get('code'), None)
+                        # logging.info(code)
+                        # doc_id = tag_details.get('id')
+                        # if code:
+                        #     docID_tagCode_dict[(inner_tag_object.get('tag').get('code'))].append(doc_id)
+                        #     logging.info("inside {data}".format(data=docID_tagCode_dict))
+                        # else:
+                        #     docID_tagCode_dict[inner_tag_object.get('tag').get('code')] = [doc_id]
+                        #     list_tags_in_old_data.append(inner_tag_object.get('tag').get('code'))
+                        tag_list.append(inner_tag_object.get('tag').get('code'))
+                    docID_tagCode_dict[tag_details.get('id')] = tag_list
+
+                logging.info(docID_tagCode_dict)
+
+                for new_update_dict in list_obj:
+                    tag_code = new_update_dict.get('tag').get('code')
+                    if True:
+                        logging.info(tag_code)
+                        # doc_ids = docID_tagCode_dict.get(tag_code)
+                        for doc_id in docID_tagCode_dict:
+                            tags = docID_tagCode_dict.get(doc_id)
+                            if tag_code in tags:
+                                if len(tags) == 1:
+                                    delete_doc_from_id(doc_id, identifier_name, request)
+
+                                else:
+                                    delete_tag_by_code(doc_id, request, tag_code)
+
+
+
+            def adding_conprehend_tags(list_obj):
+                tag_list = []
+                for j in list_obj:
+                    tag_dict_append = j['tag']
+                    # tag_dict.append(tag_dict_append)
+                    new_entry_tags = {"tagType": j['tagType'],
+                                      "tagStatus": j['tagStatus'],
+                                      "tag": tag_dict_append}
+                    temp_dict_tag = {"tag_name": tag_dict_append['name'],
+                                     "tag_code": tag_dict_append['code']}
+
+                    tag_list.append(new_entry_tags)
+                    print(tag_list)
+                    tag_code = request.dbsession.query(models.tags).filter(
+                        models.tags.tag_code == tag_dict_append['code']).first()
+                    tag_id = tag_code.tag_id
+
+                    temp_dict_doctagxrefcomprehend = {"tag_type": j['tagType'],
+                                            "tag_status": j['tagStatus'],
+                                            "createdBy": j['createdBy'],
+                                            "updatedBy": j['updatedBy'],
+                                            "document_id": documentId,
+                                            "tag_id": tag_id,
+                                            "confidence_score": j['confidence_score']
+                                            }
+                    doctagxrefcomprehend_insert = models.DocTagXREFComprehend(**temp_dict_doctagxrefcomprehend)
+                    request.dbsession.add(doctagxrefcomprehend_insert)
+
+                transaction.commit()
+
+            print(adding_conprehend_tags(list_obj))
+
+        except SQLAlchemyError as e:
+            logging.exception("message")
+            logger.error(e)
+            return "Error while inserting the tag details"
+
+        return "Tags successfully added"
+    except Exception as e:
+        logging.info(str(e))
+        return {"Error": str(e)}
+
+
+@view_config(route_name='delete_tags-o', renderer='json', request_method='OPTIONS')
+def delete_tag_options(request):
+    return {}
+
+
+@view_config(route_name='delete_tags-d', renderer='json', request_method='DELETE')
+def delete_tag(request):
+    validity = auth_interceptor(request)
+
+    if validity.get('status', None) != "200 OK":
+        logging.info(validity)
+        response = Response(validity.get('info'))
+        response.status_int = 401
+        return response
+
+    if request.method != 'DELETE':
+        return {"Error": "Predicate mis-match error, please use a DELETE call"}
+
+    tagCode = request.params.get('tagCode')
+    documentId = request.matchdict['documentId']
+    # print(tagCode)
+    return delete_tag_by_code(documentId, request, tagCode)
+
+
+def delete_tag_by_code(documentId, request, tagCode):
+    tagCode = tagCode.split(",")
+    # print(tagCode)
+    # print(type(tagCode))
+    documentId_check = request.dbsession.query(models.Document).filter(
+        models.Document.document_id == documentId).first()
+    if documentId_check is not None:
+        for i in tagCode:
+            print(i)
+            tags_code_1 = request.dbsession.query(models.tags).filter(
+                models.tags.tag_code == i).first()
+            print(tags_code_1)
+            tag_id = tags_code_1.tag_id
+
+            query = request.dbsession.query(models.DocTagXREF).filter(
+                models.DocTagXREF.document_id == documentId).filter(
+                models.DocTagXREF.tag_id == tag_id).update({models.DocTagXREF.deletedOn: datetime.datetime.now()},
+                                                           synchronize_session=False)
+            # query.delete()
+
+        return "Tags delete successful"
+    else:
+        return "The given Document Id does not exist in the database"
+
+
+@view_config(route_name='fetch_document', renderer='json', request_method='GET')
+def fetch_document(request):
+    validity = auth_interceptor(request)
+
+    if validity.get('status', None) != "200 OK":
+        logging.info(validity)
+        response = Response(validity.get('info'))
+        response.status_int = 401
+        return response
+
+    identifierName = request.matchdict['identifierName']
+    identifierValue = request.matchdict['identifierValue']
+    offset = request.params.get('offset')
+    limit = request.params.get('limit')
+    secondary_identifier_name = request.params.get('secondary_identifier_name')
+    secondary_identifier_value = request.params.get('secondary_identifier_value')
+    tagCodes = request.params.get('tagCodes')
+    # tagCodes = tagCodes.split(",")
+    # print(tagCodes)
+    # logging.info(tagCodes)
+
+    # queries = [models.DocumentMap.identifier_name == identifierName,
+    #    models.DocumentMap.identifier_value == identifierValue]
+    return create_document(identifierName, identifierValue, limit, offset, request, secondary_identifier_name,
+                           secondary_identifier_value, tagCodes)
+
+
+@view_config(route_name='fetch_documents_list', renderer='json', request_method='POST')
+def fetch_documents_list(request):
+    documents_list = loads(request.body, encoding=request.charset)
+    tags = request.params.get('tags')
+
+    fetched_documents = []
+
+    for i in documents_list:
+        identifierName = i.get('identifierName')
+        identifierValue = i.get('identifierValue')
+        secondaryIdentifierName = i.get('secondaryIdentifierName')
+        secondaryIdentifierValue = i.get('secondaryIdentifierValue')
+        details = create_document(identifierName, identifierValue, None, None, request,
+                                  secondaryIdentifierName, secondaryIdentifierValue, tags)
+
+        document_response = {
+            "identifierName": identifierName,
+            "identifierValue": identifierValue,
+            "secondaryIdentifierName": secondaryIdentifierName,
+            "secondaryIdentifierValue": secondaryIdentifierValue,
+            "documents": details
+        }
+        fetched_documents.append(document_response)
+
+    return fetched_documents
+
+@view_config(route_name='fetch_document_details', renderer='json', request_method='GET')
+def fetch_document_details(request):
+    validity = auth_interceptor(request)
+
+    if validity.get('status', None) != "200 OK":
+        logging.info(validity)
+        response = Response(validity.get('info'))
+        response.status_int = 401
+        return response
+
+    documentId = request.matchdict['documentId']
+    
+    query = request.dbsession.query(models.DocumentMap, models.Document)
+    join_query = query.join(models.Document)
+    temp = join_query.filter(models.Document.document_id == documentId).distinct().all()
+    
+    response_dict = {}
+    
+    for i in temp:
+        row2dict = i._asdict()
+        doc_obj = convert_sqlobj_json.to_json(row2dict.get("Document"))
+        
+        response_dict = {
+            "id": doc_obj.get("document_id"),
+            "mapId": doc_obj.get("document_map_id"),
+            "name": doc_obj.get("document_name"),
+            "path": doc_obj.get("document_path"),
+            "boxDocumentPath": doc_obj.get("box_document_path"),
+            "createdBy": doc_obj.get("createdBy"),
+            "updatedBy": doc_obj.get("updatedBy"),
+            "createdOn": str(doc_obj.get("createdOn")),
+            "updatedOn": str(doc_obj.get("updatedOn")),
+            "deletedOn": str(doc_obj.get("deletedOn")),       
+        }
+    if len(response_dict) == 0:
+        return Response('Not Found', status='404 Not Found')
+    else:
+        return response_dict
+
+
+def create_document(identifierName, identifierValue, limit, offset, request, secondary_identifier_name,
+                    secondary_identifier_value, tagCodes):
+    query = request.dbsession.query(models.DocumentMap,
+                                    models.Document,
+                                    )
+    join_query = query.join(models.DocumentMap)
+    temp = join_query.filter(models.DocumentMap.identifier_name == identifierName).filter(
+        models.DocumentMap.identifier_value == identifierValue,
+        models.DocumentMap.deletedOn.is_(None)).distinct().order_by(
+        models.DocumentMap.document_map_id).limit(limit).offset(offset).all()
+    # print(temp)
+    response_dict = {}
+    for i in temp:
+        # print("i=======", i)
+        row2dict = i._asdict()
+        # print(row2dict)
+        Doc_map_category = convert_sqlobj_json.to_json(row2dict.get("DocumentMap"))
+
+        Doc_category = convert_sqlobj_json.to_json(row2dict.get("Document"))
+
+        if response_dict.get(Doc_category.get("document_id"), None):
+            temp_list = convert_sqlobj_json.to_json(row2dict.get("Document"))
+
+            doc_dict = {
+                "id": temp_list.get("document_id"),
+                "name": temp_list.get("document_name"),
+                "path": temp_list.get("document_path"),
+                "boxDocumentPath": temp_list.get("box_document_path"),
+                "createdBy": temp_list.get("createdBy"),
+                "updatedBy": temp_list.get("updatedBy"),
+                # "createdOn": temp_list.get("createdOn"),
+                # "updatedOn": temp_list.get("updatedOn"),
+                # "tags": [tag_xref_dict]
+            }
+
+            response_dict.get(Doc_category.get("document_id")).get("tags").append(doc_dict)
+
+        else:
+
+            temp_list = convert_sqlobj_json.to_json(row2dict.get("Document"))
+
+            doc_dict = {
+                "id": temp_list.get("document_id"),
+                "name": temp_list.get("document_name"),
+                "path": temp_list.get("document_path"),
+                "boxDocumentPath": temp_list.get("box_document_path"),
+                "createdBy": temp_list.get("createdBy"),
+                "updatedBy": temp_list.get("updatedBy"),
+                # "createdOn": temp_list.get("createdOn"),
+                # "updatedOn": temp_list.get("updatedOn"),
+                # "tags": [tag_xref_dict]
+            }
+
+            response_dict[Doc_category.get("document_id")] = doc_dict
+    final_list_docs = []
+    for k in response_dict:
+        final_list_docs.append(response_dict.get(k))
+    # print(final_list_docs)
+    list_of_doc_ids = []
+    for m in response_dict:
+        # print(k)
+        list_of_doc_ids.append(m)
+    # print(list_of_doc_ids)
+    # logger.info(list_of_doc_ids)
+    queries = [models.DocumentMap.identifier_name == identifierName,
+               models.DocumentMap.identifier_value == identifierValue,
+               models.Document.document_id.in_(list_of_doc_ids),
+               # models.DocTagXREF.deletedOn.is_(None)
+               ]
+    # logging.info("QUERIES************")
+    # logger.info(queries)
+    query = request.dbsession.query(models.DocumentMap, models.Document, models.DocTagXREF, models.tags,
+                                    models.ProductCategoryTagXREF,
+                                    models.TagCategoryXREF)
+    join_query = query.join(models.DocumentMap).outerjoin(models.DocTagXREF).outerjoin(models.tags).outerjoin(
+        models.ProductCategoryTagXREF).outerjoin(models.TagCategoryXREF).distinct()
+
+    # logging.info("JOIN QUERYYY:::::")
+    logger.info(join_query)
+    if tagCodes:
+        tagCodes = tagCodes.split(",")
+        queries.append(models.tags.tag_code.in_(tagCodes))
+        # temp_1 = join_query.filter(*queries).offset(offset).limit(limit).all()
+        temp_1 = join_query.filter(*queries).all()
+    if secondary_identifier_name:
+        queries.append(models.DocumentMap.secondary_identifier_name == secondary_identifier_name)
+        # temp_1 = join_query.filter(*queries).offset(offset).limit(limit).all()
+        temp_1 = join_query.filter(*queries).all()
+    if secondary_identifier_value:
+        queries.append(models.DocumentMap.secondary_identifier_value == secondary_identifier_value)
+        # temp_1 = join_query.filter(*queries).offset(offset).limit(limit).all()
+        temp_1 = join_query.filter(*queries).all()
+    if secondary_identifier_name and secondary_identifier_value:
+        queries.append(models.DocumentMap.secondary_identifier_name == secondary_identifier_name)
+        queries.append(models.DocumentMap.secondary_identifier_value == secondary_identifier_value)
+        # temp_1 = join_query.filter(*queries).offset(offset).limit(limit).all()
+        temp_1 = join_query.filter(*queries).all()
+    if secondary_identifier_name and tagCodes:
+        # tagCodes = tagCodes.split(",")
+        queries.append(models.tags.tag_code.in_(tagCodes))
+        queries.append(models.DocumentMap.secondary_identifier_name == secondary_identifier_name)
+        # temp_1 = join_query.filter(*queries).offset(offset).limit(limit).all()
+        temp_1 = join_query.filter(*queries).all()
+    if secondary_identifier_value and tagCodes:
+        # tagCodes = tagCodes.split(",")
+        queries.append(models.tags.tag_code.in_(tagCodes))
+        queries.append(models.DocumentMap.secondary_identifier_value == secondary_identifier_value)
+        # temp_1 = join_query.filter(*queries).offset(offset).limit(limit).all()
+        temp_1 = join_query.filter(*queries).all()
+    if secondary_identifier_name and secondary_identifier_value and tagCodes:
+        # tagCodes = tagCodes.split(",")
+        queries.append(models.tags.tag_code.in_(tagCodes))
+        queries.append(models.DocumentMap.secondary_identifier_name == secondary_identifier_name)
+        queries.append(models.DocumentMap.secondary_identifier_value == secondary_identifier_value)
+        # temp_1 = join_query.filter(*queries).offset(offset).limit(limit).all()
+        temp_1 = join_query.filter(*queries).distinct().all()
+
+    else:
+        # temp_1 = join_query.filter(*queries).offset(offset).limit(limit).all()
+        temp_1 = join_query.filter(*queries).distinct().all()
+    # logger.info(temp_1)
+    response_dict_final = {}
+    tags_code = []
+
+    for docs in temp_1:
+        tag_flag = False
+        row2dict_final = docs._asdict()
+        logging.info(row2dict_final)
+        Doc_map_category = convert_sqlobj_json.to_json(row2dict_final.get("DocumentMap"))
+        # logging.info("Document Map Category:::::::::::::::::::")
+        # logger.info(Doc_map_category)
+        Doc_category = convert_sqlobj_json.to_json(row2dict_final.get("Document"))
+        # logging.info("Document Category:::::::::::::::::::")
+        # logger.info(Doc_category)
+        document_id_temp = response_dict_final.get(Doc_map_category.get("document_map_id"), {}).get(
+            Doc_category.get("document_id"), None)
+        if response_dict_final.get(Doc_map_category.get("document_map_id"), None) and document_id_temp:
+
+            if True:
+
+                temp_list = convert_sqlobj_json.to_json(row2dict_final.get("Document"))
+                if row2dict_final.get("DocTagXREF"):
+
+                    doc_tag_list = convert_sqlobj_json.to_json(row2dict_final.get("DocTagXREF"))
+                    if doc_tag_list.get("deletedOn") is None:
+                        tag_flag = True
+                        insert_tag_flag = True
+                        # print(doc_tag_list)
+                        temp_tags_dict = convert_sqlobj_json.to_json(row2dict_final.get("tags"))
+                        temp_tag_cat_dict = {}
+                        if row2dict_final.get("TagCategoryXREF"):
+                            temp_tag_cat_dict = convert_sqlobj_json.to_json(row2dict_final.get("TagCategoryXREF"))
+                        # print(temp_tags_dict)
+                        # logging.info("Tags table IN IF BLOCK:::::::::::::::::::")
+                        # logger.info(temp_tags_dict)
+                        tag_dict = {
+                            "name": temp_tags_dict.get("tag_name"),
+                            "code": temp_tags_dict.get("tag_code"),
+                            "description": temp_tags_dict.get("tag_description"),
+                            "tagCategory": temp_tag_cat_dict.get("name", None),
+                            "tagType": temp_tags_dict.get("tag_type")
+                        }
+                        tag_xref_dict = {
+                            "tagType": doc_tag_list.get("tag_type"),
+                            "tagStatus": doc_tag_list.get("tag_status"),
+                            "tag": tag_dict
+                        }
+                        if str(temp_tags_dict.get("tag_code")) + str(temp_list.get("document_id")) in tags_code:
+                            insert_tag_flag = False
+                        else:
+                            tags_code.append(str(temp_tags_dict.get("tag_code")) + str(temp_list.get("document_id")))
+
+                if tag_flag and insert_tag_flag:
+                    response_dict_final.get(Doc_category.get("document_map_id")).get(
+                        Doc_category.get("document_id")).get("tags").append(tag_xref_dict)
+
+                # logging.info("IF BLOCK RESPONSE DICT::::::::::::")
+                # logger.info(response_dict_final)
+
+        else:
+
+            temp_list = convert_sqlobj_json.to_json(row2dict_final.get("Document"))
+
+            if row2dict_final.get("DocTagXREF"):
+
+                doc_tag_list = convert_sqlobj_json.to_json(row2dict_final.get("DocTagXREF"))
+                if doc_tag_list.get("deletedOn") is None:
+                    tag_flag = True
+                    insert_tag_flag = True
+                    # print(doc_tag_list)
+                    temp_tags_dict = convert_sqlobj_json.to_json(row2dict_final.get("tags"))
+                    temp_tag_cat_dict = {}
+                    if row2dict_final.get("TagCategoryXREF"):
+                        temp_tag_cat_dict = convert_sqlobj_json.to_json(row2dict_final.get("TagCategoryXREF"))
+
+                    # print(temp_tags_dict)
+                    # logging.info(temp_tags_dict)
+                    # logging.info("Tags table IN ELSE BLOCK:::::::::::::::::::")
+                    # logger.info(temp_tags_dict)
+                    tag_dict = {
+                        "name": temp_tags_dict.get("tag_name"),
+                        "code": temp_tags_dict.get("tag_code"),
+                        "description": temp_tags_dict.get("tag_description"),
+                        "tagCategory": temp_tag_cat_dict.get("name", None),
+                        "tagType": temp_tags_dict.get("tag_type")
+
+                    }
+
+                    tag_xref_dict = {
+                        "tagType": doc_tag_list.get("tag_type"),
+                        "tagStatus": doc_tag_list.get("tag_status"),
+                        "tag": tag_dict
+                    }
+                    if str(temp_tags_dict.get("tag_code")) + str(temp_list.get("document_id")) in tags_code:
+                        insert_tag_flag = False
+                    else:
+                        tags_code.append(str(temp_tags_dict.get("tag_code")) + str(temp_list.get("document_id")))
+
+            doc_dict = {
+                "id": temp_list.get("document_id"),
+                "name": temp_list.get("document_name"),
+                "path": temp_list.get("document_path"),
+                "boxDocumentPath": temp_list.get("box_document_path"),
+                "createdBy": temp_list.get("createdBy"),
+                "updatedBy": temp_list.get("updatedBy"),
+                "createdOn": str(temp_list.get("createdOn")),
+                "updatedOn": str(temp_list.get("updatedOn")),
+                "tags": []
+            }
+            if tag_flag and insert_tag_flag:
+                doc_dict.update({"tags": [tag_xref_dict]})
+
+            if response_dict_final.get(Doc_map_category.get("document_map_id"), None):
+                temp_dict = response_dict_final.get(Doc_map_category.get("document_map_id"))
+                temp_dict[Doc_category.get("document_id")] = doc_dict
+                response_dict_final[Doc_map_category.get("document_map_id")] = temp_dict
+
+            else:
+                response_dict_final[Doc_map_category.get(
+                    "document_map_id")] = {
+                    Doc_category.get("document_id"): doc_dict
+                    # Doc_map_category.get("document_map_id"): doc_dict
+                }
+
+            # logging.info("ELSE BLOCK RESPONSE DICT:::::::::::::")
+            # logger.info(response_dict_final)
+    # logging.info("FINAL Dictionary:::::::::::::::::::")
+    logger.info("FINAL Dictionary:", extra=response_dict_final)
+    final_list_final_new_x = []
+    for k in response_dict_final:
+        x1 = (response_dict_final.get(k))
+        for m in x1:
+            y1 = (x1.get(m))
+            final_list_final_new_x.append(y1)
+    return final_list_final_new_x
+
+
+@view_config(route_name='update_box_path', renderer='json', request_method='POST')
+def update_box_path(request):
+    doc_data = loads(request.body, encoding=request.charset)
+    for i in range(len(doc_data)):
+        query = request.dbsession.query(models.Document).filter(
+            models.Document.document_id == doc_data[i]['doc_id']).update(
+            {models.Document.box_document_path: json.dumps(doc_data[i]['box_path'])},
+            synchronize_session=False)
+    transaction.commit()
+    print("Done")
+    return "Box path updated"
