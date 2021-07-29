@@ -1,0 +1,1 @@
+DELETE documents/{id}/tags?tagCode=<list_of_tagCodes>
