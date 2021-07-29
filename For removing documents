@@ -1,0 +1,5 @@
+To Remove Individual Document
+DELETE {identifier_name}/{identifier_name}/documents/{documentId}
+
+To Remove all the documents tagged to a identifier
+DELETE {identifier_name}/{identifier_name}/documents/
