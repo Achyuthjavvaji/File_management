@@ -1,0 +1,25 @@
+GET loantype/{loanType}/loanstage/{loanStage}/loanstate/{loanState}
+{
+    "loanType": "Bridge",
+    "loanStage": "Pre",
+    "loanState": "Approved",
+    "minimumOptionalDocumentCount": "2",
+    "tags": [
+        {
+            "isMandatory": true,
+            "tag": {
+                "name": "Current Photo ID",
+                "code": "DPHT",
+                "description": "Sample description"
+            }
+        },
+        {
+            "isMandatory": false,
+            "tag": {
+                "name": "Background Check",
+                "code": "DBCK",
+                "description": "Sample description"
+            }
+        }
+    ]
+}
