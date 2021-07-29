@@ -1,0 +1,45 @@
+-- To get all the documents attached.
+-- In the header set the x-total-count to show total number of documents.
+
+-- default: offset = 0
+-- default: limit = unlimited
+GET {identifier_name}/{identifier_value}/documents
+?offset={offset}
+&limit={limit}
+&secondary_identifier_name={secondary_identifier_name}
+&secondary_identifier_value={secondary_identifier_value}
+&tagCodes=DBCK,DPHT
+
+[
+        {
+            "id": 123456,
+            "name": "photo_id",
+            "path": "<s3_path>",
+            "box_document_path": "<box_document_path>",
+            "createdBy": "<userId>",
+            "updatedBy": "<userId>",
+            "createdOn": "<timestamp>",
+            "updatedOn": "<timestamp>",
+            "tags": [
+                {
+                    "tagType": "MANUAL/METADATA",
+                    "tagStatus": "VALID/REMOVED/REPLACED",
+                    "comment":"Additional Info on OTHER type tags",
+                    "tag": {
+                        "name": "Current Photo ID",
+                        "code": "DPHT",
+                        "description": "Sample description"
+                    }
+                },
+                {
+                    "tagType": "MANUAL/METADATA",
+                    "tagStatus": "VALID/REMOVED/REPLACED",
+                    "tag": {
+                        "name": "Background Check",
+                        "code": "DBCK",
+                        "description": "Sample description"
+                    }
+                }
+            ]
+        }
+    ]
