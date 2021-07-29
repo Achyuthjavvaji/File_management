@@ -1,0 +1,23 @@
+PUT documents/{id}/tags
+[
+    {
+        "tagType": "MANUAL/METADATA",
+        "tagStatus": "VALID/REMOVED/REPLACED",
+        "comment":"Additional Info on OTHER type tags",
+        "tag": {
+            "name": "Current Photo ID",
+            "code": "DPHT",
+            "description": "Sample description"
+        }
+    },
+    {
+        "tagType": "MANUAL/METADATA",
+        "tagStatus": "VALID/REMOVED/REPLACED",
+        "comment":"Additional Info on OTHER type tags",
+        "tag": {
+            "name": "Background Check",
+            "code": "DBCK",
+            "description": "Sample description"
+        }
+    }
+]
